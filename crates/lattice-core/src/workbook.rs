@@ -5,7 +5,8 @@ use crate::error::{LatticeError, Result};
 use crate::filter_view::FilterViewStore;
 use crate::formula::SheetResolver;
 use crate::named_function::{NamedFunction, NamedFunctionStore};
-use crate::named_range::NamedRangeStore;
+use crate::named_range::{NamedRange, NamedRangeStore};
+use crate::selection::Range;
 use crate::sheet::Sheet;
 use crate::validation::ValidationStore;
 
@@ -154,6 +155,90 @@ impl Workbook {
     /// Get a named function by name (case-insensitive).
     pub fn get_named_function(&self, name: &str) -> Option<&NamedFunction> {
         self.named_functions.get(name)
+    }
+
+    // ── Sheet layout operations ────────────────────────────────────────
+
+    /// Duplicate a sheet (deep copy of all cells / state) and insert a copy
+    /// immediately after the source sheet. Returns an error if `new_name` is
+    /// already taken.
+    pub fn duplicate_sheet(&mut self, name: &str, new_name: &str) -> Result<()> {
+        if !self.sheets.contains_key(name) {
+            return Err(LatticeError::SheetNotFound(name.to_string()));
+        }
+        if self.sheets.contains_key(new_name) {
+            return Err(LatticeError::SheetAlreadyExists(new_name.to_string()));
+        }
+        let mut copy = self.sheets.get(name).cloned().ok_or_else(|| {
+            LatticeError::SheetNotFound(name.to_string())
+        })?;
+        copy.name = new_name.to_string();
+        copy.tab_color = None;
+        let mut new_sheets = IndexMap::new();
+        for (key, sheet) in self.sheets.drain(..) {
+            new_sheets.insert(key.clone(), sheet);
+            if key == name {
+                new_sheets.insert(new_name.to_string(), copy.clone());
+            }
+        }
+        self.sheets = new_sheets;
+        Ok(())
+    }
+
+    /// Reorder a sheet to a given tab index (0-based). The index is clamped
+    /// to the valid range `0..=len-1`.
+    pub fn move_sheet(&mut self, name: &str, to_index: usize) -> Result<()> {
+        if !self.sheets.contains_key(name) {
+            return Err(LatticeError::SheetNotFound(name.to_string()));
+        }
+        let to_index = to_index.min(self.sheets.len().saturating_sub(1));
+        let mut sheets: Vec<(String, Sheet)> = self.sheets.drain(..).collect();
+        let idx = sheets
+            .iter()
+            .position(|(k, _)| k == name)
+            .ok_or_else(|| LatticeError::SheetNotFound(name.to_string()))?;
+        let entry = sheets.remove(idx);
+        sheets.insert(to_index, entry);
+        self.sheets = sheets.into_iter().collect();
+        Ok(())
+    }
+
+    /// Set (or clear) a sheet's tab color. `Some(color)` sets a hex color;
+    /// `None` or an empty string clears it.
+    pub fn set_sheet_tab_color(&mut self, name: &str, color: Option<&str>) -> Result<()> {
+        let sheet = self.sheets.get_mut(name).ok_or_else(|| {
+            LatticeError::SheetNotFound(name.to_string())
+        })?;
+        let c = color.filter(|c| !c.is_empty()).map(|c| c.to_string());
+        sheet.set_tab_color(c);
+        Ok(())
+    }
+
+    // ── Named Ranges ───────────────────────────────────────────────────
+
+    /// Add a named range (see [`NamedRangeStore::add`]).
+    pub fn add_named_range(
+        &mut self,
+        name: &str,
+        sheet: Option<String>,
+        range: Range,
+    ) -> Result<()> {
+        self.named_ranges.add(name.to_string(), sheet, range)
+    }
+
+    /// Remove a named range by name (case-insensitive).
+    pub fn remove_named_range(&mut self, name: &str) -> Result<()> {
+        self.named_ranges.remove(name)
+    }
+
+    /// List all named ranges in the workbook.
+    pub fn list_named_ranges(&self) -> Vec<&NamedRange> {
+        self.named_ranges.list()
+    }
+
+    /// Resolve a named range to its `(sheet, range)` tuple (case-insensitive).
+    pub fn resolve_named_range(&self, name: &str) -> Option<(Option<&str>, &Range)> {
+        self.named_ranges.resolve(name)
     }
 }
 

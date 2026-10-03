@@ -170,6 +170,14 @@ impl Default for CellFormat {
     }
 }
 
+impl CellFormat {
+    /// Return `true` if this format is entirely default (the same as
+    /// `CellFormat::default()`), i.e. no explicit formatting was applied.
+    pub fn is_default(&self) -> bool {
+        self == &CellFormat::default()
+    }
+}
+
 impl NumberFormat {
     /// Convert this structured format to an Excel-compatible pattern string.
     ///

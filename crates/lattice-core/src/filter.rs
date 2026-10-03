@@ -97,6 +97,14 @@ impl Default for AutoFilter {
     }
 }
 
+impl FilterCondition {
+    /// Return `true` if the given cell value satisfies this condition
+    /// (mirrors the internal [`matches_condition`] helper).
+    pub fn matches(&self, val: &CellValue) -> bool {
+        matches_condition(val, self)
+    }
+}
+
 /// Check if a cell value matches a filter condition.
 fn matches_condition(val: &CellValue, condition: &FilterCondition) -> bool {
     match condition {
