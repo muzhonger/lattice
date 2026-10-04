@@ -22,8 +22,8 @@ use quick_xml::Reader as XmlReader;
 use quick_xml::events::{BytesStart, Event};
 
 use lattice_core::{
-    Border, BorderStyle, Cell, CellBorders, CellError, CellFormat, CellValue, HAlign, TextWrap,
-    VAlign, Workbook,
+    Border, BorderStyle, Cell, CellBorders, CellError, CellFormat, CellValue, HAlign, Sheet,
+    TextWrap, VAlign, Workbook,
 };
 
 use crate::{IoError, Result};
@@ -614,11 +614,11 @@ fn parse_color_element(e: &BytesStart, theme: &[String]) -> Option<String> {
 
 fn border_style_from(name: &str) -> BorderStyle {
     match name {
-        "thin" => BorderStyle::Thin,
+        "thin" | "hair" => BorderStyle::Thin,
         "medium" | "mediumDashed" => BorderStyle::Medium,
         "thick" => BorderStyle::Thick,
         "double" => BorderStyle::Double,
-        "dotted" | "mediumDotted" | "hair" => BorderStyle::Dotted,
+        "dotted" | "mediumDotted" => BorderStyle::Dotted,
         "dashed" | "dashDot" | "dashDotDot" | "slantDashDot" | "mediumDashDot"
         | "mediumDashDotDot" => BorderStyle::Dashed,
         _ => BorderStyle::None,
@@ -1108,24 +1108,39 @@ fn resolve_xf(xf: &XfDef, dict: &StyleDict) -> CellFormat {
 
 /// Does a resolved format carry any *visible* styling worth attaching?
 ///
-/// Font size/name are excluded on purpose: virtually every xlsx declares a
-/// default font (e.g. Calibri 11) that differs from our own default
-/// (`Arial 11`). Treating that as "styled" would attach a format object to
-/// every single cell in every imported file.
+/// Thin wrapper over [`CellFormat::is_notable`] so the reader and the writer
+/// cannot drift apart on "what counts as styled".
 fn format_is_notable(cf: &CellFormat) -> bool {
-    cf.bold
-        || cf.italic
-        || cf.underline
-        || cf.strikethrough
-        || cf.font_color.is_some()
-        || cf.bg_color.is_some()
-        || cf.number_format.is_some()
-        || cf.h_align != HAlign::Left
-        || cf.v_align != VAlign::Bottom
-        || cf.text_wrap == TextWrap::Wrap
-        || cf.text_rotation != 0
-        || cf.indent != 0
-        || cf.borders != CellBorders::default()
+    cf.is_notable()
+}
+
+/// How far past the last **valued** cell a styled-but-empty cell may sit and
+/// still be materialised.
+///
+/// A formatted empty cell is how Excel represents a formatted-but-empty area
+/// (a bordered empty row, the empty right half of a bordered table, …), so it
+/// has to survive the import. But a stray styled cell far away would inflate
+/// `used_range` and bloat memory, so cells beyond the content plus a small
+/// margin are treated as "outside the table" and dropped.
+/// 8 matches `apply_format`'s own clamp (`used_range + 8`) in the app.
+const STYLE_MARGIN: u32 = 8;
+
+/// Bottom-right corner of the cells that actually **hold a value** (0-based).
+///
+/// Note this is *not* `Sheet::used_range()`: the latter is the max key in the
+/// cell map, which after this import includes the very styled-but-empty cells
+/// we are about to create.
+fn valued_bounds(sheet: &Sheet) -> (u32, u32) {
+    let mut max_row = 0;
+    let mut max_col = 0;
+    for (&(row, col), cell) in sheet.cells() {
+        if matches!(cell.value, CellValue::Empty) {
+            continue;
+        }
+        max_row = max_row.max(row);
+        max_col = max_col.max(col);
+    }
+    (max_row, max_col)
 }
 
 /// Sheet-level bits read from a worksheet XML.
@@ -1306,6 +1321,9 @@ fn apply_styles_and_layout_from_bytes(bytes: &[u8], workbook: &mut Workbook) -> 
             continue;
         };
 
+        // Bottom-right corner of the *valued* cells: the yardstick for which
+        // styled-but-empty cells are near enough to the table to keep.
+        let (valued_max_row, valued_max_col) = valued_bounds(sheet);
         for (&(row, col), &idx) in &layout.cell_styles {
             let Some(cf) = styles.get(idx) else { continue };
             if !format_is_notable(cf) {
@@ -1313,6 +1331,21 @@ fn apply_styles_and_layout_from_bytes(bytes: &[u8], workbook: &mut Workbook) -> 
             }
             if let Some(cell) = sheet.get_cell_mut(row, col) {
                 cell.format = cf.clone();
+            } else if row <= valued_max_row.saturating_add(STYLE_MARGIN)
+                && col <= valued_max_col.saturating_add(STYLE_MARGIN)
+            {
+                // 有样式、没值：必须物化成 `Empty` 占位。不物化的话，边框/底色这些
+                // “靠格子存在才画得出来”的东西会整片丢失——Excel 正是用这种空格子
+                // 表示“格式化过但没内容”的区域（表格框线的下半截、留白、模板）。
+                sheet.set_cell(
+                    row,
+                    col,
+                    Cell {
+                        value: CellValue::Empty,
+                        format: cf.clone(),
+                        ..Default::default()
+                    },
+                );
             }
         }
 
@@ -1882,6 +1915,7 @@ mod style_import_tests {
         assert_eq!(border_style_from("medium"), BorderStyle::Medium);
         assert_eq!(border_style_from("thick"), BorderStyle::Thick);
         assert_eq!(border_style_from("double"), BorderStyle::Double);
+        assert_eq!(border_style_from("hair"), BorderStyle::Thin, "hairline 是实线，不是虚线");
         assert_eq!(border_style_from("dotted"), BorderStyle::Dotted);
         assert_eq!(border_style_from("dashDot"), BorderStyle::Dashed);
         assert_eq!(border_style_from("none"), BorderStyle::None);
@@ -2063,10 +2097,13 @@ mod style_import_tests {
             CellFormat::default(),
             "普通单元格保持默认格式，不因 Calibri 而加壳"
         );
-        assert!(
-            sheet.get_cell(0, 3).is_none(),
-            "有样式但无值的单元格不应被物化（否则会撑大 used_range）"
-        );
+        // D1 在文件里是 `<c r="D1" s="1"/>`：有样式、没值。**必须物化**——
+        // Excel 就是用这种格子表示“格式化过但没内容”的区域，丢了的话表格框线、
+        // 底色会整片缺失（用户报「边框渲染的不对」）。
+        let d1 = sheet.get_cell(0, 3).expect("D1 应被物化成空值占位");
+        assert_eq!(d1.value, CellValue::Empty, "占位必须是空值，不能在表里凭空多出内容");
+        assert!(d1.format.bold && d1.format.bg_color.is_some(), "样式要跟着一起留下");
+        assert!(d1.format.borders.bottom.is_some(), "边框是用户看得见的那部分");
 
         assert!(
             sheet
@@ -2080,6 +2117,83 @@ mod style_import_tests {
         assert!(sheet.hidden_rows.contains(&1));
         assert!(sheet.hidden_cols.contains(&3) && sheet.hidden_cols.contains(&4));
         assert_eq!(sheet.tab_color.as_deref(), Some("#00B050"));
+    }
+
+    #[test]
+    fn styled_empty_cells_far_outside_the_table_are_not_materialised() {
+        // 表格之外的“幻影样式格”（Excel 里常见于曾整行整列刷过格式的文件）不物化——
+        // 否则一个远离数据的 A999 能把 used_range 拉到第 999 行。
+        let sheet_xml = r#"<?xml version="1.0"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1" t="inlineStr"><is><t>x</t></is></c><c r="Z1" s="1"/></row><row r="900"><c r="A900" s="1"/></row></sheetData></worksheet>"#;
+        let bytes = build_xlsx(&[
+            ("[Content_Types].xml", CONTENT_TYPES),
+            ("_rels/.rels", ROOT_RELS),
+            ("xl/workbook.xml", WORKBOOK_XML),
+            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+            ("xl/worksheets/sheet1.xml", sheet_xml),
+            ("xl/styles.xml", STYLES_XML),
+        ]);
+        let wb = read_xlsx_from_bytes(&bytes).expect("should read");
+        let sheet = wb.get_sheet("Sheet1").unwrap();
+        assert!(sheet.get_cell(899, 0).is_none(), "远处的样式格不物化（A900）");
+        assert!(sheet.get_cell(0, 25).is_none(), "远处的样式格不物化（Z1）");
+        // 靠得近的还得留下。
+        assert!(sheet.get_cell(0, 0).is_some());
+    }
+
+    /// **不变量**：导入 → 导出 → 再导入，模型不得变样。
+    ///
+    /// 这是这一片区的“系统性闸门”：逐个 bug 写断言只能卡住已知的坑，
+    /// 而“读得进、写不回”这类不对称丢样式的问题（框线丢一半就是这样），
+    /// 只要两端对不上就会在这里暴露。
+    #[test]
+    fn import_export_import_is_stable() {
+        let first = read_xlsx_from_bytes(&foreign_xlsx()).expect("first read");
+        let bytes = crate::xlsx_writer::write_xlsx_to_buffer(&first).expect("export");
+        let second = read_xlsx_from_bytes(&bytes).expect("second read");
+
+        assert_eq!(snapshot(&second), snapshot(&first), "导入→导出→导入 不得改变模型");
+    }
+
+    /// 可比快照：格子（值 + 除去字体名/字号之外的格式）+ 合并区 + 活动表。
+    ///
+    /// 字体名/字号故意排除：我们写文件时用的是自己的默认字体，再读回来必然是它，
+    /// 与源文件的（Calibri 等）不同——那是既定取舍（见 `CellFormat::is_notable`），
+    /// 不是回归。列宽行高也排除：rust_xlsxwriter 会补 ~0.8 字符宽。
+    fn snapshot(wb: &Workbook) -> Vec<String> {
+        let mut out = vec![format!("active={}", wb.active_sheet)];
+        for name in wb.sheet_names() {
+            let s = wb.get_sheet(&name).unwrap();
+            let mut rows: Vec<String> = s
+                .cells()
+                .iter()
+                .map(|(&(r, c), cell)| {
+                    let mut f = cell.format.clone();
+                    f.font_size = 0.0;
+                    f.font_family = String::new();
+                    format!("{name}!{r}:{c}={:?}|{:?}", cell.value, f)
+                })
+                .collect();
+            rows.sort();
+            out.extend(rows);
+            let mut merges: Vec<_> = s
+                .merged_regions()
+                .iter()
+                .map(|m| format!("{name}!merge {}:{}:{}:{}", m.start_row, m.start_col, m.end_row, m.end_col))
+                .collect();
+            merges.sort();
+            out.extend(merges);
+            out.push(format!("{name}!tab={:?}", s.tab_color));
+            out.push(format!("{name}!hidden_rows={:?}", {
+                let mut v: Vec<_> = s.hidden_rows.iter().copied().collect();
+                v.sort();
+                v
+            }));
+            let mut hc: Vec<_> = s.hidden_cols.iter().copied().collect();
+            hc.sort();
+            out.push(format!("{name}!hidden_cols={hc:?}"));
+        }
+        out
     }
 
     #[test]

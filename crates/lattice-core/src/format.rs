@@ -176,6 +176,38 @@ impl CellFormat {
     pub fn is_default(&self) -> bool {
         self == &CellFormat::default()
     }
+
+    /// Return `true` if this format carries *visible* styling worth keeping.
+    ///
+    /// Font size/name are deliberately excluded: virtually every xlsx declares
+    /// a default font (e.g. Calibri 11) that differs from ours (`Arial 11`).
+    /// Counting that as "styled" would attach a format to every cell of every
+    /// imported file.
+    ///
+    /// This is the single predicate shared by the two sides of file I/O:
+    ///  - `xlsx_reader` uses it to decide whether a *valueless* cell still needs
+    ///    to exist (a bordered/filled empty cell is how Excel represents a
+    ///    formatted-but-empty area — dropping it loses the table's frame);
+    ///  - `xlsx_writer` uses it to decide whether an empty cell is worth writing
+    ///    back as a blank styled cell.
+    /// If these two disagreed, an import/export round trip would silently change
+    /// the file — so they must stay in sync (this is why the predicate lives
+    /// here rather than being duplicated per crate).
+    pub fn is_notable(&self) -> bool {
+        self.bold
+            || self.italic
+            || self.underline
+            || self.strikethrough
+            || self.font_color.is_some()
+            || self.bg_color.is_some()
+            || self.number_format.is_some()
+            || self.h_align != HAlign::Left
+            || self.v_align != VAlign::Bottom
+            || self.text_wrap == TextWrap::Wrap
+            || self.text_rotation != 0
+            || self.indent != 0
+            || self.borders != CellBorders::default()
+    }
 }
 
 impl NumberFormat {

@@ -100,7 +100,14 @@ fn build_xlsx_workbook(workbook: &Workbook) -> Result<XlsxWorkbook> {
 
             match &cell.value {
                 CellValue::Empty => {
-                    // Nothing to write for empty cells.
+                    // 空值也可能带样式：Excel 用「有样式没值」的格子表示格式化过的空白区
+                    // （边框、底色）。不写这一笔，导入时保住的框线在导出时又会丢——
+                    // 两个方向必须对称。纯默认格式的空占位不写，避免无谓撑大文件。
+                    if cell.format.is_notable() {
+                        worksheet.write_blank(row, col as u16, &fmt).map_err(|e| {
+                            IoError::XlsxWrite(e.to_string())
+                        })?;
+                    }
                 }
                 CellValue::Text(s) => {
                     worksheet
@@ -232,6 +239,12 @@ fn cell_format_to_xlsx_format(cf: &lattice_core::CellFormat) -> Format {
         && let Some(color) = parse_hex_color(fc)
     {
         fmt = fmt.set_font_color(color);
+    } else {
+        // `font_color: None` 的语义是“用应用默认字色”，不是黑色。
+        // rust_xlsxwriter 的默认值是 `Color::Default`，会写成 `<color theme="1"/>`，
+        // 再读回来就成了“显式黑色”——导入→导出→导入后每个格子都被钉死成黑色，
+        // 深色主题下文字反而看不见。`Automatic` 会让它**不写** `<color>`，往返才稳定。
+        fmt = fmt.set_font_color(Color::Automatic);
     }
 
     if let Some(ref bg) = cf.bg_color
