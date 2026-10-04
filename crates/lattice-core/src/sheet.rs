@@ -417,6 +417,50 @@ impl Sheet {
         Ok(())
     }
 
+    /// Register a merged region that came from an imported file.
+    ///
+    /// Unlike [`Sheet::merge_cells`], this does **not** clear the cells below
+    /// and to the right of the top-left corner. The source file is the
+    /// authority on both the merge and the stored values; silently dropping
+    /// values that a file happens to keep inside a merged block would lose
+    /// data on import.
+    ///
+    /// Returns `false` (and adds nothing) for degenerate rectangles (`end`
+    /// before `start`) and for regions that overlap an existing merged region.
+    pub fn add_merged_region_from_import(
+        &mut self,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> bool {
+        if end_row < start_row || end_col < start_col {
+            return false;
+        }
+        let overlaps = self.merged_regions.iter().any(|r| {
+            regions_overlap(
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                r.start_row,
+                r.start_col,
+                r.end_row,
+                r.end_col,
+            )
+        });
+        if overlaps {
+            return false;
+        }
+        self.merged_regions.push(MergedRegion {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        });
+        true
+    }
+
     /// Unmerge a previously merged region that contains the given cell.
     ///
     /// Returns `Ok(true)` if a region was unmerged, `Ok(false)` if the cell
@@ -2743,5 +2787,30 @@ mod tests {
     fn test_remove_col_group_invalid_index() {
         let mut sheet = Sheet::new("S1");
         assert!(sheet.remove_col_group(0).is_err());
+    }
+
+    // ----- add_merged_region_from_import (used by the xlsx import path) -----
+
+    #[test]
+    fn test_add_merged_region_from_import_keeps_inner_values() {
+        let mut sheet = Sheet::new("S1");
+        sheet.set_value(0, 0, CellValue::Text("标题".into()));
+        sheet.set_value(0, 1, CellValue::Text("顺带存的".into()));
+        assert!(sheet.add_merged_region_from_import(0, 0, 0, 2));
+        assert_eq!(sheet.merged_regions().len(), 1);
+        assert!(
+            sheet.get_cell(0, 1).is_some(),
+            "导入路径不得像 merge_cells 那样清空合并区内单元格"
+        );
+    }
+
+    #[test]
+    fn test_add_merged_region_from_import_skips_degenerate_and_overlap() {
+        let mut sheet = Sheet::new("S1");
+        assert!(!sheet.add_merged_region_from_import(1, 1, 0, 0), "倒置矩形");
+        assert!(sheet.add_merged_region_from_import(0, 0, 1, 1));
+        assert!(!sheet.add_merged_region_from_import(1, 1, 2, 2), "与已有区域重叠");
+        assert!(sheet.add_merged_region_from_import(4, 4, 4, 5), "相邻不算重叠");
+        assert_eq!(sheet.merged_regions().len(), 2);
     }
 }

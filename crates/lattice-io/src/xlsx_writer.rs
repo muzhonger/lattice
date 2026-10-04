@@ -65,6 +65,26 @@ fn build_xlsx_workbook(workbook: &Workbook) -> Result<XlsxWorkbook> {
             .set_name(&sheet_name)
             .map_err(|e| IoError::XlsxWrite(e.to_string()))?;
 
+        // Register merged regions *before* writing cells.
+        //
+        // `merge_range` writes its `string` argument into the top-left cell, so
+        // doing it after the cell loop would blank out the value that the
+        // top-left cell had (a merged title row is the common case). Merging
+        // first records the range, then the normal cell write supplies the
+        // real value and format.
+        for region in sheet.merged_regions() {
+            worksheet
+                .merge_range(
+                    region.start_row,
+                    region.start_col as u16,
+                    region.end_row,
+                    region.end_col as u16,
+                    "",
+                    &Format::new(),
+                )
+                .map_err(|e| IoError::XlsxWrite(e.to_string()))?;
+        }
+
         // Write cells.
         for (&(row, col), cell) in sheet.cells() {
             let fmt = cell_format_to_xlsx_format(&cell.format);
@@ -106,10 +126,14 @@ fn build_xlsx_workbook(workbook: &Workbook) -> Result<XlsxWorkbook> {
                 CellValue::Date(s) => {
                     // Try to write as a proper Excel date serial number.
                     if let Some(serial) = iso_to_excel_serial(s) {
-                        let date_fmt = if s.contains('T') {
-                            Format::new().set_num_format("yyyy-mm-dd hh:mm:ss")
-                        } else {
-                            Format::new().set_num_format("yyyy-mm-dd")
+                        // Prefer the date pattern read from the source file
+                        // (round-trip fidelity); fall back to a sensible default.
+                        let date_fmt = match cell.format.number_format.as_deref() {
+                            Some(pattern) => Format::new().set_num_format(pattern),
+                            None if s.contains('T') => {
+                                Format::new().set_num_format("yyyy-mm-dd hh:mm:ss")
+                            }
+                            None => Format::new().set_num_format("yyyy-mm-dd"),
                         };
                         worksheet
                             .write_number_with_format(row, col as u16, serial, &date_fmt)
@@ -155,20 +179,6 @@ fn build_xlsx_workbook(workbook: &Workbook) -> Result<XlsxWorkbook> {
         for (&row, &height) in &sheet.row_heights {
             worksheet
                 .set_row_height(row, height)
-                .map_err(|e| IoError::XlsxWrite(e.to_string()))?;
-        }
-
-        // Write merged regions.
-        for region in sheet.merged_regions() {
-            worksheet
-                .merge_range(
-                    region.start_row,
-                    region.start_col as u16,
-                    region.end_row,
-                    region.end_col as u16,
-                    "",
-                    &Format::new(),
-                )
                 .map_err(|e| IoError::XlsxWrite(e.to_string()))?;
         }
 
