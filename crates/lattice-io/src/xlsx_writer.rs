@@ -176,9 +176,18 @@ fn build_xlsx_workbook(workbook: &Workbook) -> Result<XlsxWorkbook> {
         }
 
         // Write column widths.
+        //
+        // 刻意走像素入口而不是 `set_column_width(chars)`：rust_xlsxwriter 内部
+        // `chars -> px` 用 `round(chars * 7) + 5`（5 是单元格内边距），而写出
+        // `<col width>` 时又用 `px / 7` 反算——少减了那 5px，于是**写出的宽度
+        // 永远比模型多 0.71 字符（≈5px）**，导出一遍列就胖一圈。
+        // 喂 `chars * 7` 进去，写出值正好等于模型里的字符数；Excel 侧按
+        // `px = round(chars * 7) + 5` 读回来也自洽（同一个 64px）。
+        const PX_PER_CHAR: f64 = 7.0;
         for (&col, &width) in &sheet.col_widths {
+            let px = (width * PX_PER_CHAR).round().max(0.0) as u32;
             worksheet
-                .set_column_width(col as u16, width)
+                .set_column_width_pixels(col as u16, px)
                 .map_err(|e| IoError::XlsxWrite(e.to_string()))?;
         }
 
@@ -450,6 +459,7 @@ mod tests {
 
         write_xlsx(&wb, &path).unwrap();
         assert!(path.exists());
+
     }
 
     #[test]
@@ -484,6 +494,29 @@ mod tests {
 
         write_xlsx(&wb, &path).unwrap();
         assert!(path.exists());
+
+        // 回归守卫（vNext）：写出的字符宽必须等于模型里的字符宽。
+        // 修复前 `set_column_width(chars)` 会写成 chars + 5/7 ≈ 20.71 / 30.71，
+        // 导出一遍列宽就胖 5px，再导入回来就跟原表不一样了。
+        let back = crate::xlsx_reader::read_xlsx(&path).unwrap();
+        let back_sheet = back.get_sheet("Sheet1").unwrap();
+        assert!(
+            (back_sheet.col_widths[&0] - 20.0).abs() < 0.01,
+            "列宽 20 字符写出去变成了 {}",
+            back_sheet.col_widths[&0]
+        );
+        assert!(
+            (back_sheet.col_widths[&1] - 30.0).abs() < 0.01,
+            "列宽 30 字符写出去变成了 {}",
+            back_sheet.col_widths[&1]
+        );
+        // 行高走的是 pt → 整数 px → pt 的往返（库的既有行为），25 磅会落成 24.75，
+        // 差 0.33px，肉眼无感；这里只守「没出现 5px 级别的大偏差」。
+        assert!(
+            (back_sheet.row_heights[&0] - 25.0).abs() < 1.0,
+            "行高 25 磅写出去变成了 {}",
+            back_sheet.row_heights[&0]
+        );
     }
 
     #[test]
